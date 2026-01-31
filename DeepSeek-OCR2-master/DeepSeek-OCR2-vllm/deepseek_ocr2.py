@@ -1,52 +1,198 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Inference-only Deepseek-OCR model compatible with HuggingFace weights."""
 
-# adapted from https://github.com/deepseek-ai/DeepSeek-VL2/blob/faf18023f24b962b32d9f0a2d89e402a8d383a78/deepseek_vl2/models/modeling_deepseek_vl_v2.py
-"""Inference-only Deepseek-VL2 model compatible with HuggingFace weights."""
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from typing import List, Literal, Optional, Set, Tuple, TypedDict, Union
+from typing import Annotated, Literal, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange, repeat
-from transformers import BatchFeature
+from transformers import BatchFeature, CLIPVisionConfig
 
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.utils import set_default_torch_dtype
+from vllm.config.multimodal import BaseDummyOptions
+from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsLoRA,
+    SupportsMultiModal,
+    SupportsPP,
+)
+from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    init_vllm_registered_model,
+    maybe_prefix,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
-                                    MultiModalKwargs, MultiModalUUIDDict, NestedTensors)
-from vllm.multimodal.parse import (ImageEmbeddingItems, ImageProcessorItems,
-                                   ImageSize, MultiModalDataItems)
-from vllm.multimodal.processing import (BaseMultiModalProcessor,
-                                        BaseProcessingInfo, PromptReplacement,
-                                        PromptUpdate)
-from vllm.multimodal.profiling import BaseDummyInputsBuilder
+from vllm.multimodal.inputs import (
+    MultiModalDataDict,
+    MultiModalFieldConfig,
+    MultiModalKwargsItems,
+    NestedTensors,
+)
+from vllm.multimodal.parse import (
+    ImageEmbeddingItems,
+    ImageProcessorItems,
+    ImageSize,
+    MultiModalDataItems,
+)
+try:
+    from vllm.multimodal.profiling import BaseDummyInputsBuilder
+except Exception:
+    from vllm.multimodal.processing import BaseDummyInputsBuilder
+# from vllm.multimodal.profiling import BaseDummyInputsBuilder
+from vllm.multimodal.processing import (
+    # BaseDummyInputsBuilder,
+    BaseMultiModalProcessor,
+    BaseProcessingInfo,
+    PromptReplacement,
+    PromptUpdate,
+)
+from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs.deepseek_vl2 import (DeepseekVLV2Config,
-                                                          MlpProjectorConfig,
-                                                          VisionEncoderConfig)
+from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.transformers_utils.configs.deepseek_vl2 import DeepseekVLV2Config
 from process.image_process import (
-    DeepseekOCR2Processor, count_tiles)
-from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
-# from vllm.utils import is_list_of
-
-from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
-from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper, flatten_bn,
-                    init_vllm_registered_model, maybe_prefix,
-                    merge_multimodal_embeddings)
+    BASE_SIZE,
+    CROP_MODE,
+    IMAGE_SIZE,
+    DeepseekOCR2Processor,
+    count_tiles,
+)
+from vllm.utils.tensor_schema import TensorSchema, TensorShape
+from vllm.v1.sample.logits_processor import (
+    AdapterLogitsProcessor,
+    RequestLogitsProcessor,
+)
 
 from deepencoderv2.sam_vary_sdpa import build_sam_vit_b
-# from deepencoder.clip_sdpa import build_clip_l
 from deepencoderv2.qwen2_d2e import build_qwen2_decoder_as_encoder
-from deepencoderv2.build_linear import MlpProjector
-from addict import Dict
-# import time
-from config import IMAGE_SIZE, BASE_SIZE, CROP_MODE, PRINT_NUM_VIS_TOKENS, PROMPT
+from vllm.model_executor.models.deepseek_vl2 import MlpProjector
+
 # The image token id may be various
 _IMAGE_TOKEN = "<image>"
+
+
+class DeepseekOCRImagePixelInputs(TensorSchema):
+    """
+    Dimensions:
+        - b: Batch size
+        - n: Number of images
+        - p: Number of patches
+        - base_size: Base size of the processor
+        - image_size: Image size of the processor
+    """
+
+    type: Literal["pixel_values"]
+    data: Annotated[
+        torch.Tensor,
+        TensorShape("bn", 3, "base_size", "base_size", dynamic_dims={"bnp"}),
+    ]
+    images_crop: Annotated[
+        torch.Tensor,
+        TensorShape("bnp", 3, "image_size",
+                    "image_size", dynamic_dims={"bnp"}),
+    ]
+    images_spatial_crop: Annotated[torch.Tensor, TensorShape("bn", 2)]
+
+
+class NoRepeatNGramLogitsProcessor:
+    def __init__(
+            self,
+            ngram_size: int,
+            window_size: int,
+            whitelist_token_ids: set[int] | None = None,
+    ):
+        self.ngram_size = ngram_size
+        self.window_size = window_size
+        self.whitelist_token_ids = whitelist_token_ids or set()
+
+    def __call__(
+            self,
+            output_ids: list[int],
+            logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if len(output_ids) < self.ngram_size:
+            return logits
+
+        current_prefix = tuple(output_ids[-(self.ngram_size - 1):])
+
+        search_start = max(0, len(output_ids) - self.window_size)
+        search_end = len(output_ids) - self.ngram_size + 1
+
+        banned_tokens = set()
+        for i in range(search_start, search_end):
+            ngram = tuple(output_ids[i: i + self.ngram_size])
+            if ngram[:-1] == current_prefix:
+                banned_tokens.add(ngram[-1])
+
+        banned_tokens = banned_tokens - self.whitelist_token_ids
+
+        if banned_tokens:
+            logits[list(banned_tokens)] = -float("inf")
+
+        return logits
+
+
+class NGramPerReqLogitsProcessor(AdapterLogitsProcessor):
+    """Example of overriding the wrapper class `__init__()` in order to utilize
+    info about the device type"""
+
+    @classmethod
+    def validate_params(cls, params: SamplingParams):
+        ngram_size = params.extra_args and params.extra_args.get("ngram_size")
+        window_size = params.extra_args and params.extra_args.get(
+            "window_size", 100)
+        whitelist_token_ids = params.extra_args and params.extra_args.get(
+            "whitelist_token_ids", None
+        )
+        # if ngram_size is not provided, skip validation because the processor
+        # will not be used.
+        if ngram_size is None:
+            return None
+
+        if not isinstance(ngram_size, int) or ngram_size <= 0:
+            raise ValueError(
+                f"`ngram_size` has to be a strictly positive integer, got {ngram_size}."
+            )
+        if not isinstance(window_size, int) or window_size <= 0:
+            raise ValueError(
+                "`window_size` has to be a strictly positive integer, "
+                f"got {window_size}."
+            )
+        if whitelist_token_ids is not None and not isinstance(
+                whitelist_token_ids, Iterable
+        ):
+            raise ValueError(
+                "`whitelist_token_ids` has to be a sequence of integers, "
+                f"got {whitelist_token_ids}."
+            )
+
+    def is_argmax_invariant(self) -> bool:
+        return False
+
+    def new_req_logits_processor(
+            self,
+            params: SamplingParams,
+    ) -> RequestLogitsProcessor | None:
+        ngram_size = params.extra_args and params.extra_args.get("ngram_size")
+        window_size = params.extra_args and params.extra_args.get(
+            "window_size", 100)
+        whitelist_token_ids = params.extra_args and params.extra_args.get(
+            "whitelist_token_ids", None
+        )
+        if ngram_size is None:
+            return None
+
+        whitelist_token_ids = set(
+            whitelist_token_ids) if whitelist_token_ids else None
+        return NoRepeatNGramLogitsProcessor(
+            ngram_size=ngram_size,
+            window_size=window_size,
+            whitelist_token_ids=whitelist_token_ids,
+        )
 
 
 class DeepseekOCR2ProcessingInfo(BaseProcessingInfo):
@@ -57,7 +203,7 @@ class DeepseekOCR2ProcessingInfo(BaseProcessingInfo):
     def get_hf_processor(self, **kwargs: object):
         return self.ctx.get_hf_processor(DeepseekOCR2Processor, **kwargs)
 
-    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"image": None}
 
     def get_num_image_tokens(self,
@@ -65,8 +211,7 @@ class DeepseekOCR2ProcessingInfo(BaseProcessingInfo):
                              image_width: int,
                              image_height: int,
                              cropping: bool = True) -> int:
-        hf_processor = self.get_hf_processor()
-
+        # hf_processor = self.get_hf_processor()
 
         # image_size = hf_processor.image_size
         # patch_size = hf_processor.patch_size
@@ -84,12 +229,13 @@ class DeepseekOCR2ProcessingInfo(BaseProcessingInfo):
                 # images_crop_raw, crop_ratio = hf_processor.dynamic_preprocess(image)
 
                 # find the closest aspect ratio to the target
-                crop_ratio = count_tiles(image_width, image_height, image_size=IMAGE_SIZE)
+                crop_ratio = count_tiles(image_width, image_height,
+                                         image_size=IMAGE_SIZE)
 
                 # print('===========')
                 # print('crop_ratio ', crop_ratio)
                 # print('============')
-                
+
             num_width_tiles, num_height_tiles = crop_ratio
         else:
             num_width_tiles = num_height_tiles = 1
@@ -99,24 +245,23 @@ class DeepseekOCR2ProcessingInfo(BaseProcessingInfo):
         h2 = w2 = math.ceil((image_size // patch_size) / downsample_ratio)
 
         global_views_tokens = h * (w)
-        if num_width_tiles >1 or num_height_tiles>1:
-            local_views_tokens = (num_height_tiles * h2) * (num_width_tiles * w2)
+        if num_width_tiles > 1 or num_height_tiles > 1:
+            local_views_tokens = (num_height_tiles * h2) * \
+                (num_width_tiles * w2)
         else:
             local_views_tokens = 0
-
 
         return global_views_tokens + local_views_tokens + 1
 
     def get_image_size_with_most_features(self) -> ImageSize:
 
         if IMAGE_SIZE == 1024 and BASE_SIZE == 1280:
-            return ImageSize(width=1024*2, height=1024*2)
-        return ImageSize(width=768*2, height=768*2)
+            return ImageSize(width=1024 * 2, height=1024 * 2)
+        return ImageSize(width=768 * 2, height=768 * 2)
 
 
 class DeepseekOCR2DummyInputsBuilder(
         BaseDummyInputsBuilder[DeepseekOCR2ProcessingInfo]):
-
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         num_images = mm_counts.get("image", 0)
 
@@ -126,76 +271,73 @@ class DeepseekOCR2DummyInputsBuilder(
         return image_token * num_images
 
     def get_dummy_mm_data(
-        self,
-        seq_len: int,
-        mm_counts: Mapping[str, int],
+            self,
+            seq_len: int,
+            mm_counts: Mapping[str, int],
+            mm_options: Mapping[str, BaseDummyOptions] | None = None,
     ) -> MultiModalDataDict:
         num_images = mm_counts.get("image", 0)
 
         max_image_size = self.info.get_image_size_with_most_features()
 
-        if '<image>' in PROMPT:
-            return {
-                "image":
-                DeepseekOCR2Processor().tokenize_with_images(images = self._get_dummy_images(width=max_image_size.width,
-                                    height=max_image_size.height,
-                                    num_images=num_images), bos=True, eos=True, cropping=CROP_MODE)
-            }
-        else:
-            return {
-                "image": []
-            }
+        return {
+            "image": self._get_dummy_images(
+                width=max_image_size.width,
+                height=max_image_size.height,
+                num_images=num_images,
+            )
+        }
 
 
-
-
-class DeepseekOCR2MultiModalProcessor(
-        BaseMultiModalProcessor[DeepseekOCR2ProcessingInfo]):
-    
-
+class DeepseekOCRMultiModalProcessor(
+    BaseMultiModalProcessor[DeepseekOCR2ProcessingInfo]
+):
     def _call_hf_processor(
-        self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
+            self,
+            prompt: str,
+            mm_data: Mapping[str, object],
+            mm_kwargs: Mapping[str, object],
+            tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         if mm_data:
-            # Call the processor directly with correct arguments
-            hf_processor = self.info.get_hf_processor(**mm_kwargs)
-            # Convert the old-style call to the new signature
-            mm_data_dict = {"image": mm_data.get("images", [])} if "images" in mm_data else mm_data
-            processed_outputs = hf_processor(
-                prompt=prompt,
-                mm_data=mm_data_dict,
-                hf_processor_mm_kwargs=mm_kwargs,
+            processed_outputs = self.info.ctx.call_hf_processor(
+                self.info.get_hf_processor(**mm_kwargs),
+                dict(prompt=prompt, **mm_data),
+                mm_kwargs,
             )
 
         else:
             tokenizer = self.info.get_tokenizer()
-            processed_outputs = tokenizer(prompt,
-                                          add_special_tokens=True,
-                                          return_tensors="pt")
+            processed_outputs = tokenizer(
+                prompt, add_special_tokens=True, return_tensors="pt"
+            )
 
         return processed_outputs
 
     def _get_mm_fields_config(
-        self,
-        hf_inputs: BatchFeature,
-        hf_processor_mm_kwargs: Mapping[str, object],
+            self,
+            hf_inputs: BatchFeature,
+            hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
+        images_spatial_crop = hf_inputs.get(
+            "images_spatial_crop", torch.empty((0, 2)))
+        is_tiled = (images_spatial_crop[:, 0] > 1) | (
+            images_spatial_crop[:, 1] > 1)
+        patches_per_image = torch.where(
+            is_tiled, images_spatial_crop.prod(dim=-1), 0)
         return dict(
             pixel_values=MultiModalFieldConfig.batched("image"),
             images_spatial_crop=MultiModalFieldConfig.batched("image"),
-            # image_embeds=MultiModalFieldConfig.batched("image2"),
-            images_crop=MultiModalFieldConfig.batched("image"),
+            images_crop=MultiModalFieldConfig.flat_from_sizes(
+                "image", patches_per_image
+            ),
         )
 
     def _get_prompt_updates(
-        self,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        out_mm_kwargs: MultiModalKwargs,
+            self,
+            mm_items: MultiModalDataItems,
+            hf_processor_mm_kwargs: Mapping[str, object],
+            out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
 
@@ -204,22 +346,17 @@ class DeepseekOCR2MultiModalProcessor(
 
         def get_replacement_deepseek_vl2(item_idx: int):
             images = mm_items.get_items(
-                "image", (ImageEmbeddingItems, ImageProcessorItems))
-
-
+                "image", (ImageEmbeddingItems, ImageProcessorItems)
+            )
 
             if isinstance(images, ImageEmbeddingItems):
                 num_image_tokens = images.get_feature_size(item_idx)
             else:
-
-                
-                width = images[0][-1][0][0]
-                height = images[0][-1][0][1]
+                size = images.get_image_size(item_idx)
 
                 num_image_tokens = self.info.get_num_image_tokens(
-                    image_width=width,
-                    image_height=height,
-                    # flag = True,
+                    image_width=size.width,
+                    image_height=size.height,
                     cropping=CROP_MODE,
                 )
             return [image_token_id] * num_image_tokens
@@ -232,60 +369,42 @@ class DeepseekOCR2MultiModalProcessor(
             )
         ]
 
-    def _cached_apply_hf_processor(
-        self,
-        prompt: Union[str, list[int]],
-        mm_data_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-        mm_uuids: Optional[MultiModalUUIDDict] = None,
-    ) -> tuple[list[int], MultiModalKwargs, bool]:
-        # The processor logic is different for len(images) <= 2 vs > 2
-        # Since the processing cache assumes that the processor output is
-        # invariant of how many images are passed per prompt, we only
-        # perform caching for the most common case
-        if mm_data_items.get_count("image", strict=False) > 2:
-            # This code path corresponds to the cache being disabled
-            return self._apply_hf_processor_main(
-                prompt=prompt,
-                mm_items=mm_data_items,
-                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-                tokenization_kwargs=tokenization_kwargs,
-                mm_uuids=mm_uuids,
-                enable_hf_prompt_update=True,
-            )
-
-        return super()._cached_apply_hf_processor(
-            prompt,
-            mm_data_items,
-            hf_processor_mm_kwargs,
-            tokenization_kwargs,
-            mm_uuids=mm_uuids,
-        )
-
 
 @MULTIMODAL_REGISTRY.register_processor(
-    DeepseekOCR2MultiModalProcessor,
+    DeepseekOCRMultiModalProcessor,
     info=DeepseekOCR2ProcessingInfo,
-    dummy_inputs=DeepseekOCR2DummyInputsBuilder)
-class DeepseekOCR2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
+    dummy_inputs=DeepseekOCR2DummyInputsBuilder,
+)
+class DeepseekOCR2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            # map prefix for language backbone
+            "model.embed_tokens.": "language_model.model.embed_tokens.",
+            "model.layers.": "language_model.model.layers.",
+            "model.norm.": "language_model.model.norm.",
+            "lm_head.": "language_model.lm_head.",
+            "model.qwen2_model.": "vision_model.",
+            # remove "model." prefix for other components
+            "model.": "",
+        }
+    )
 
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={
-        "language.": "language_model.",
-    })
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return "<image>"
+
+        raise ValueError("Only image modality is supported")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
         config: DeepseekVLV2Config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
+        # quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
-
-        # config.model_type ='deepseek_vl_v2'
 
         self.config = config
         self.multimodal_config = multimodal_config
-
 
         self.vision_config = config.vision_config
         self.projector_config = config.projector_config
@@ -296,292 +415,177 @@ class DeepseekOCR2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self.image_token_id = tokenizer.vocab[_IMAGE_TOKEN]
 
         self.sam_model = build_sam_vit_b()
-        self.qwen2_model = build_qwen2_decoder_as_encoder()
+        self.vision_model = build_qwen2_decoder_as_encoder()
 
-        n_embed = 1280
-        self.projector =  MlpProjector(Dict(projector_type="linear", input_dim=896, n_embed=n_embed))
+        self.projector = MlpProjector(self.projector_config)
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
-    
-        # self.sam_model = torch.compile(self.sam_model, mode="reduce-overhead")
-        # self.vision_model = torch.compile(self.vision_model, mode="reduce-overhead")
-        # self.projector = torch.compile(self.projector, mode="max-autotune")
-
-
-
 
         # special token for image token sequence format
-        embed_std = 1 / torch.sqrt(torch.tensor(n_embed, dtype=torch.float32))
+        n_embed = self.projector_config.n_embed
+        embed_std = 1 / \
+            torch.sqrt(torch.tensor(n_embed, dtype=torch.float32))
         if self.tile_tag == "2D":
-            # <|view_separator|>, <|\n|>
-            # self.image_newline = nn.Parameter(torch.randn(n_embed) * embed_std)
-            self.view_seperator = nn.Parameter(torch.randn(n_embed) * embed_std)
+            # This is a typo in original implementation
+            self.view_seperator = nn.Parameter(
+                torch.randn(n_embed) * embed_std)
         else:
             raise ValueError(
                 f"Only 2D tile_tag is supported currently, got: {self.tile_tag}"
             )
 
-        if self.text_config.topk_method == "noaux_tc":
-            architectures = ["DeepseekV3ForCausalLM"]
-            # architectures = ["DeepseekForCausalLM"]
-        elif not self.text_config.use_mla:
-            architectures = ["DeepseekForCausalLM"]
-        else:
-            architectures = ["DeepseekV2ForCausalLM"]
-
         self.language_model = init_vllm_registered_model(
             vllm_config=vllm_config,
             hf_config=self.text_config,
-            prefix=maybe_prefix(prefix, "language"),
-            architectures=architectures,
+            prefix=maybe_prefix(prefix, "language_model"),
         )
 
         self.make_empty_intermediate_tensors = (
-            self.language_model.make_empty_intermediate_tensors)
-        
-
-
-        self.sam_model.to(dtype=torch.bfloat16)
-
-
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     def _parse_and_validate_image_input(
-            self, **kwargs: object):
-        
+            self, **kwargs: object
+    ) -> DeepseekOCRImagePixelInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
         images_spatial_crop = kwargs.pop("images_spatial_crop", None)
         images_crop = kwargs.pop("images_crop", None)
 
-
         if pixel_values is None or torch.sum(pixel_values).item() == 0:
             return None
 
-        if pixel_values is not None:
-            if not isinstance(pixel_values, (torch.Tensor, list)):
-                raise ValueError("Incorrect type of pixel values. "
-                                 f"Got type: {type(pixel_values)}")
+        base_size = self.vision_config.image_size
+        return DeepseekOCRImagePixelInputs(
+            type="pixel_values",
+            data=pixel_values,
+            images_crop=images_crop,
+            images_spatial_crop=images_spatial_crop,
+            resolve_bindings={
+                "base_size": base_size,
+            },
+        )
 
-            if not isinstance(images_spatial_crop, (torch.Tensor, list)):
-                raise ValueError("Incorrect type of image sizes. "
-                                 f"Got type: {type(images_spatial_crop)}")
-            
-            if not isinstance(images_crop, (torch.Tensor, list)):
-                raise ValueError("Incorrect type of image crop. "
-                                 f"Got type: {type(images_crop)}")
+    def _encode_global_features(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        global_features_1 = self.sam_model(image_tensor)
+        global_features_2 = self.vision_model(global_features_1)
 
-            return [pixel_values, images_crop, images_spatial_crop]
+        features = self.projector(global_features_2)
 
+        _, hw, dim = features.shape
 
-        raise AssertionError("This line should be unreachable.")
-    
+        return features.view(-1, dim)
 
+    def _encode_local_features(
+            self, patches: torch.Tensor
+    ) -> torch.Tensor | None:
+        if torch.sum(patches).item() == 0:
+            return None
+
+        local_features = self.sam_model(patches)
+        local_features = self.vision_model(local_features)
+
+        features = self.projector(local_features)
+
+        _, _, dim = features.shape
+
+        return features.view(-1, dim)
 
     def _pixel_values_to_embedding(
-        self,
-        pixel_values: torch.Tensor,
-        images_crop: torch.Tensor,
-        images_spatial_crop: torch.Tensor,
+            self,
+            pixel_values: torch.Tensor,
+            images_crop: torch.Tensor,
+            images_spatial_crop: torch.Tensor,
     ) -> NestedTensors:
-
-        # Pixel_values (global view): [n_image, batch_size, 3, height, width]
-        # images_spatial_crop: [n_image, batch_size, [num_tiles_w, num_tiles_h]]
-        # images_crop (local view): [n_image, batch_size, num_pathes, 3, h, w]
-        # split the pixel and image_crop, all batch_size = 1
-
         images_in_this_batch = []
 
+        is_tiled = (images_spatial_crop[:, 0] > 1) | (
+            images_spatial_crop[:, 1] > 1)
+        patches_per_image = torch.where(
+            is_tiled, images_spatial_crop.prod(dim=-1), 0)
+        images_crop = images_crop.split(patches_per_image.tolist())
+        for jdx in range(images_spatial_crop.size(0)):
+            patches = images_crop[jdx]
+            image_ori = pixel_values[[jdx]]
 
-        with torch.no_grad():
-            for jdx in range(images_spatial_crop.size(0)):
-                # with torch.set_grad_enabled(False):
-                patches = images_crop[jdx][0].to(torch.bfloat16) # batch_size = 1
-                # patches = images_crop[jdx][0]
-                image_ori = pixel_values[jdx]
-                crop_shape = images_spatial_crop[jdx][0]
+            global_features = self._encode_global_features(image_ori)
+            local_features = self._encode_local_features(patches)
 
-                if torch.sum(patches).item() != 0:  # if all values = 0, no crop
-                    # P, C, H, W = patches.shape
-                    # crop_flag = 1
-                    local_features_1 = self.sam_model(patches)
-                    #TODO del patches 
-                    # torch.compiler.cudagraph_mark_step_begin()
-                    local_features_2 = self.qwen2_model(local_features_1)  
+            if local_features is not None:
+                combined = torch.cat(
+                    [local_features, global_features,
+                        self.view_seperator[None, :]],
+                    dim=0,
+                )
+            else:
+                combined = torch.cat(
+                    [global_features, self.view_seperator[None, :]], dim=0
+                )
 
-
-                    # local_features = torch.cat((local_features_2[:, 1:], local_features_1.flatten(2).permute(0, 2, 1)), dim=-1) 
-                    local_features = self.projector(local_features_2)
-
-
-                    global_features_1 = self.sam_model(image_ori)
-                    global_features_2 = self.qwen2_model(global_features_1) 
-                    # global_features = torch.cat((global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1) 
-                    global_features = self.projector(global_features_2)
-
-                    if PRINT_NUM_VIS_TOKENS:
-                        print('=====================')
-                        print('BASE: ', global_features.shape)
-                        print('PATCHES: ', local_features.shape)
-                        print('=====================')
-
-                    _, hw, n_dim = global_features.shape
-                    # h = w = int(hw ** 0.5)
-
-                    _2, hw2, n_dim2 = local_features.shape
-                    # h2 = w2 = int(hw2 ** 0.5)
-
-                    # width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
-
-                    # global_features = global_features.view(h, w, n_dim)
-
-                    # global_features = torch.cat(
-                    #     [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
-                    # )
-
-                    global_features = global_features.view(-1, n_dim)
-
-
-                    # local_features = local_features.view(height_crop_num, width_crop_num, h2, w2, n_dim2).permute(0, 2, 1, 3, 4).reshape(height_crop_num*h2, width_crop_num*w2, n_dim2)
-                    # local_features = torch.cat(
-                    #     [local_features, self.image_newline[None, None, :].expand(height_crop_num * h2, 1, n_dim2)], dim=1
-                    # )
-                    local_features = local_features.view(-1, n_dim2)
-
-                    global_local_features = torch.cat([local_features, global_features, self.view_seperator[None, :]], dim=0)
-                
-                else:
-                    global_features_1 = self.sam_model(image_ori)
-                    global_features_2 = self.qwen2_model(global_features_1) 
-                    # global_features = torch.cat((global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1) 
-                    global_features = self.projector(global_features_2)
-
-                    if PRINT_NUM_VIS_TOKENS:
-                        print('=====================')
-                        print('BASE: ', global_features.shape)
-                        print('NO PATCHES')
-                        print('=====================')
-
-                    _, hw, n_dim = global_features.shape
-                    # h = w = int(hw ** 0.5)
-
-                    # global_features = global_features.view(h, w, n_dim)
-
-                    # global_features = torch.cat(
-                    #     [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
-                    # )
-
-                    global_features = global_features.view(-1, n_dim)
-
-                    global_local_features = torch.cat([global_features, self.view_seperator[None, :]], dim=0)
-
-                images_in_this_batch.append(global_local_features)
+            images_in_this_batch.append(combined)
 
         return images_in_this_batch
 
     def _process_image_input(
-            self, image_input) -> torch.Tensor:
-        
+            self, image_input: DeepseekOCRImagePixelInputs
+    ) -> torch.Tensor:
+        pixel_values = image_input.data
+        images_crop = image_input.images_crop
+        images_spatial_crop = image_input.images_spatial_crop.to(
+            dtype=torch.long)
 
-        # image_input: [pixel_values, images_crop, images_spatial_crop]
-    
-        pixel_values = image_input[0].to(torch.bfloat16)
-
-        # images_crop = image_input[1].to(torch.bfloat16)
-        images_crop = image_input[1]
-        # images_crop = image_input[1]
-        images_spatial_crop = image_input[2].to(dtype=torch.long)
-
-        # local_start = time.time()
         vision_features = self._pixel_values_to_embedding(
-            pixel_values=pixel_values, images_crop = images_crop,  images_spatial_crop=images_spatial_crop)
-
+            pixel_values=pixel_values,
+            images_crop=images_crop,
+            images_spatial_crop=images_spatial_crop,
+        )
 
         return vision_features
 
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
 
-    def get_multimodal_embeddings(
-            self, **kwargs: object) -> Optional[MultiModalEmbeddings]:
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
             return None
         vision_embeddings = self._process_image_input(image_input)
         return vision_embeddings
-    
 
-
-    def get_input_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
-    ) -> torch.Tensor:
-        
-
-
-        inputs_embeds = self.language_model.get_input_embeddings(input_ids)
-        # input_ids.to(torch.bfloat16)
-        # self.image_token_id.to(torch.bfloat16)
-
-        if multimodal_embeddings is not None:
-            # multimodal_embeddings = multimodal_embeddings.to(torch.bfloat16)
-            # multimodal_embeddings = [emb.to(torch.bfloat16) for emb in multimodal_embeddings]
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids, inputs_embeds, multimodal_embeddings,
-                self.image_token_id)
-
-            
-        return inputs_embeds
-
-    def forward(self,
-                input_ids: torch.Tensor,
-                positions: torch.Tensor,
-                intermediate_tensors: Optional[IntermediateTensors] = None,
-                inputs_embeds: Optional[torch.Tensor] = None,
-                **kwargs: object):
-
+    def forward(
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            intermediate_tensors: IntermediateTensors | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+            **kwargs: object,
+    ):
         if intermediate_tensors is not None:
             inputs_embeds = None
 
-        # NOTE: In v1, inputs_embeds is always generated at model runner, this
-        # condition is for v0 compatibility
-        elif inputs_embeds is None:
-            vision_embeddings = self.get_multimodal_embeddings(**kwargs)
-            inputs_embeds = self.get_input_embeddings(input_ids,
-                                                      vision_embeddings)
-            input_ids = None
-
-        hidden_states = self.language_model(input_ids,
-                                            positions,
-                                            intermediate_tensors,
-                                            inputs_embeds=inputs_embeds)
+        hidden_states = self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds
+        )
 
         return hidden_states
 
     def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+            self,
+            hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        processed_weights = []
-        
-        for name, tensor in weights:
-            if 'sam_model' in name or 'qwen2_model' in name or 'projector' in name or 'view_seperator' in name:
-                new_name = name.replace('model.', '', 1)
-            else:
-                new_name = 'language.' + name
-            
-            # tensor = tensor.to(torch.bfloat16)
-
-            processed_weights.append((new_name, tensor))
-        
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        autoloaded_weights = loader.load_weights(processed_weights, mapper=self.hf_to_vllm_mapper)
-
-
-
-
-
+        autoloaded_weights = loader.load_weights(
+            weights, mapper=self.hf_to_vllm_mapper)
         return autoloaded_weights
+
+    def get_mm_mapping(self) -> MultiModelKeys:
+        """
+        Get the module prefix in multimodal models
+        """
+        return MultiModelKeys.from_string_field(
+            language_model="language_model",
+            connector="projector",
+            tower_model=["sam_model", "vision_model"],
+        )

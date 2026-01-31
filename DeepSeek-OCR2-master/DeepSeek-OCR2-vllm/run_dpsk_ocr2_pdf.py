@@ -22,40 +22,9 @@ from deepseek_ocr2 import DeepseekOCR2ForCausalLM
 
 from vllm.model_executor.models.registry import ModelRegistry
 
-from vllm import LLM, SamplingParams
-# NOTE: VLLM V1 does not support per-request logits processors
-# from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
 from process.image_process import DeepseekOCR2Processor
 
 ModelRegistry.register_model("DeepseekOCR2ForCausalLM", DeepseekOCR2ForCausalLM)
-
-
-llm = LLM(
-    model=MODEL_PATH,
-    hf_overrides={"architectures": ["DeepseekOCR2ForCausalLM"]},
-    block_size=256,
-    enforce_eager=False,
-    trust_remote_code=True, 
-    max_model_len=8192,
-    swap_space=0,
-    max_num_seqs=MAX_CONCURRENCY,
-    tensor_parallel_size=1,
-    gpu_memory_utilization=0.9,
-    disable_mm_preprocessor_cache=True
-)
-
-# NOTE: VLLM V1 does not support per-request logits processors
-# Using repetition_penalty as an alternative to NoRepeatNGramLogitsProcessor
-# logits_processors = [NoRepeatNGramLogitsProcessor(ngram_size=20, window_size=50, whitelist_token_ids= {128821, 128822})]
-
-sampling_params = SamplingParams(
-    temperature=0.0,
-    max_tokens=8192,
-    # NOTE: Using repetition_penalty instead of custom logits processor for V1 compatibility
-    repetition_penalty=1.05,  # Slight penalty to discourage repetition
-    skip_special_tokens=False,
-    include_stop_str_in_output=True,
-)
 
 
 class Colors:
@@ -235,6 +204,28 @@ def process_single_image(image):
 
 
 if __name__ == "__main__":
+    from vllm import LLM, SamplingParams
+
+    llm = LLM(
+        model=MODEL_PATH,
+        hf_overrides={"architectures": ["DeepseekOCR2ForCausalLM"]},
+        block_size=256,
+        enforce_eager=False,
+        trust_remote_code=True, 
+        max_model_len=6144,
+        swap_space=0,
+        max_num_seqs=MAX_CONCURRENCY,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.865,
+    )
+
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=6144,
+        repetition_penalty=1.05,  # Slight penalty to discourage repetition
+        skip_special_tokens=False,
+        include_stop_str_in_output=True,
+    )
 
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     os.makedirs(f'{OUTPUT_PATH}/images', exist_ok=True)

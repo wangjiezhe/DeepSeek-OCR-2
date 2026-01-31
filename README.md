@@ -69,18 +69,16 @@ git clone https://github.com/deepseek-ai/DeepSeek-OCR-2.git
 ```
 2. Conda
 ```Shell
-conda create -n deepseek-ocr2 python=3.12.9 -y
+conda create -n deepseek-ocr2 python=3.13 -y
 conda activate deepseek-ocr2
 ```
 3. Packages
 
 ```Shell
-pip install -r requirements.txt
-pip install transformers==4.55.4
-# vLLM 0.11.0
-pip install https://github.com/vllm-project/vllm/releases/download/v0.11.0/vllm-0.11.0+cu129-cp38-abi3-manylinux1_x86_64.whl
-# Adapt flash-attention for torch2.8 and cuda12
-pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+pip install PyMuPDF img2pdf einops easydict addict Pillow numpy==2.2.6
+pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.8.3+cu129torch2.9-cp313-cp313-linux_x86_64.whl
+pip install vllm==0.15.0 --torch-backend=cu129
+pip install flashinfer-jit-cache==0.6.1 --default-index-url https://flashinfer.ai/whl/cu129
 ```
 
 ## vLLM-Inference
