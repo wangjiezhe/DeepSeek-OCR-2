@@ -1,0 +1,10 @@
+{
+  "[python]": {
+    "editor.formatOnSave": false,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "never",
+      "source.organizeImports.ruff": "never"
+    }
+  },
+  "markdown.extension.toc.updateOnSave": false
+}
